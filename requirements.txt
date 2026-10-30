@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+python-multipart
+ollama
+faster-whisper
+av<19
+python-dotenv

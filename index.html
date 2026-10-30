@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Video AI Chat</title>
+<style>
+  :root { --bg:#fff; --fg:#1a1a1a; --muted:#6b6b6b; --card:#f3f3f1; --accent:#2f5bea; --green:#1f9d55; --amber:#d98a00; --rec:#d63a3a; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#16161a; --fg:#ececec; --muted:#9a9aa2; --card:#222228; --accent:#6c8cff; --green:#4cc27f; --amber:#f0b429; --rec:#ff6b6b; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, sans-serif; background:var(--bg); color:var(--fg);
+         display:flex; flex-direction:column; align-items:center; padding:16px; gap:12px; }
+  .col { width:100%; max-width:640px; }
+  video { width:100%; border-radius:14px; background:#000; transform:scaleX(-1); }
+  #pill { align-self:center; padding:6px 14px; border-radius:999px; background:var(--card); font-size:.95rem; }
+  #pill.listening { color:var(--green); } #pill.hearing { color:var(--rec); }
+  #pill.thinking { color:var(--amber); } #pill.speaking { color:var(--accent); }
+  .meter { height:6px; background:var(--card); border-radius:3px; overflow:hidden; }
+  #level { height:100%; width:0; background:var(--accent); transition:width .05s; }
+  #start { padding:16px; font-size:1.05rem; border:0; border-radius:14px; background:var(--accent); color:#fff; cursor:pointer; }
+  #start.on { background:var(--rec); }
+  label { font-size:.9rem; color:var(--muted); display:block; }
+  #err { color:var(--rec); font-size:.9rem; min-height:1.2em; }
+  #log { display:flex; flex-direction:column; gap:8px; }
+  .msg { padding:10px 14px; border-radius:12px; background:var(--card); line-height:1.4; }
+  .msg.you { align-self:flex-end; background:var(--accent); color:#fff; }
+</style>
+</head>
+<body>
+  <video id="cam" class="col" autoplay muted playsinline></video>
+  <div id="pill">Not started</div>
+  <div class="meter col"><div id="level"></div></div>
+  <button id="start" class="col">Start conversation</button>
+  <div class="col">
+    <label><input type="checkbox" id="seeMe" checked> Let the AI see my camera</label>
+    <label><input type="checkbox" id="barge"> Allow interrupting the AI (use headphones, otherwise it can hear itself)</label>
+  </div>
+  <div id="err" class="col"></div>
+  <div id="log" class="col"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const cam = $("cam"), pill = $("pill"), level = $("level"), startBtn = $("start");
+const seeMe = $("seeMe"), barge = $("barge"), log = $("log"), errEl = $("err");
+const sessionId = crypto.randomUUID();
+
+// Tunables
+const FRAME_SAMPLES = 2048;   // audio block size (~43 ms at 48 kHz)
+const SILENCE_MS = 800;       // pause that ends your turn
+const MIN_SPEECH_MS = 400;    // ignore blips shorter than this
+const MIN_THRESHOLD = 0.012;  // never go below this volume level
+const PREROLL_FRAMES = 8;     // audio kept from just before speech was detected
+
+let stream, ctx, sampleRate, frameMs, running = false;
+let recording = false, rec = [], pre = [], voiceFrames = 0, silenceMs = 0, voicedMs = 0;
+let noise = 0.005;
+let streaming = false, pending = 0, gen = 0, abortCtl = null;
+
+const aiBusy = () => streaming || pending > 0;
+
+function updatePill() {
+  let t = ["Listening…", "listening"];
+  if (!running) t = ["Not started", ""];
+  else if (recording) t = ["Hearing you…", "hearing"];
+  else if (streaming && pending === 0) t = ["Thinking…", "thinking"];
+  else if (aiBusy()) t = ["Speaking…", "speaking"];
+  pill.textContent = t[0];
+  pill.className = t[1];
+}
+
+function addMsg(text, who) {
+  const d = document.createElement("div");
+  d.className = "msg " + who;
+  d.textContent = text;
+  log.appendChild(d);
+  d.scrollIntoView({ behavior: "smooth", block: "end" });
+  return d;
+}
+
+// ---------- Voice activity detection ----------
+function onFrame(f) {
+  let sum = 0;
+  for (let i = 0; i < f.length; i++) sum += f[i] * f[i];
+  const rms = Math.sqrt(sum / f.length);
+  level.style.width = Math.min(100, rms * 600) + "%";
+
+  const ai = aiBusy();
+  if (ai && !barge.checked && !recording) { pre = []; voiceFrames = 0; return; } // don't hear ourselves
+
+  const thr = Math.max(MIN_THRESHOLD, noise * 3) * (ai ? 2 : 1);
+  const voice = rms > thr;
+
+  if (!recording) {
+    pre.push(f); if (pre.length > PREROLL_FRAMES) pre.shift();
+    if (!voice) noise = noise * 0.95 + rms * 0.05; // track background noise
+    voiceFrames = voice ? voiceFrames + 1 : 0;
+    if (voiceFrames >= 3) startRecording();
+  } else {
+    rec.push(f);
+    if (voice) { silenceMs = 0; voicedMs += frameMs; } else silenceMs += frameMs;
+    if (silenceMs >= SILENCE_MS || rec.length * frameMs > 30000) endRecording();
+  }
+}
+
+function interrupt() {
+  gen++;
+  speechSynthesis.cancel();
+  if (abortCtl) abortCtl.abort();
+  streaming = false; pending = 0;
+}
+
+function startRecording() {
+  recording = true;
+  rec = pre; pre = [];
+  silenceMs = 0; voicedMs = voiceFrames * frameMs; voiceFrames = 0;
+  interrupt(); // barge-in: stop the AI the moment you start talking
+  updatePill();
+}
+
+function endRecording() {
+  recording = false;
+  const frames = rec; rec = [];
+  updatePill();
+  if (voicedMs >= MIN_SPEECH_MS) sendTurn(frames);
+}
+
+// ---------- Talking to the server ----------
+function encodeWav(frames) {
+  const n = frames.reduce((a, f) => a + f.length, 0);
+  const buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
+  const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  w(0, "RIFF"); v.setUint32(4, 36 + n * 2, true); w(8, "WAVE"); w(12, "fmt ");
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, sampleRate, true); v.setUint32(28, sampleRate * 2, true);
+  v.setUint16(32, 2, true); v.setUint16(34, 16, true); w(36, "data"); v.setUint32(40, n * 2, true);
+  let o = 44;
+  for (const f of frames) for (let i = 0; i < f.length; i++) {
+    const s = Math.max(-1, Math.min(1, f[i]));
+    v.setInt16(o, s < 0 ? s * 0x8000 : s * 0x7fff, true); o += 2;
+  }
+  return new Blob([buf], { type: "audio/wav" });
+}
+
+function grabFrame() {
+  const w = Math.min(640, cam.videoWidth), h = Math.round(w * cam.videoHeight / cam.videoWidth);
+  const c = document.createElement("canvas");
+  c.width = w; c.height = h;
+  c.getContext("2d").drawImage(cam, 0, 0, w, h);
+  return new Promise(res => c.toBlob(res, "image/jpeg", 0.7));
+}
+
+function speak(text, g) {
+  const u = new SpeechSynthesisUtterance(text);
+  pending++;
+  const fin = () => { if (g === gen) { pending = Math.max(0, pending - 1); updatePill(); } };
+  u.onend = fin; u.onerror = fin;
+  speechSynthesis.speak(u);
+  updatePill();
+}
+
+async function sendTurn(frames) {
+  const myGen = ++gen;
+  streaming = true;
+  abortCtl = new AbortController();
+  updatePill();
+
+  const fd = new FormData();
+  fd.append("session_id", sessionId);
+  fd.append("audio", encodeWav(frames), "speech.wav");
+  if (seeMe.checked) fd.append("frame", await grabFrame(), "frame.jpg");
+
+  let aiDiv = null;
+  const handle = m => {
+    if (myGen !== gen) return;
+    if (m.type === "transcript") { addMsg(m.text, "you"); aiDiv = addMsg("", "ai"); }
+    else if (m.type === "sentence" && aiDiv) {
+      aiDiv.textContent += (aiDiv.textContent ? " " : "") + m.text;
+      speak(m.text, myGen);
+    } else if (m.type === "error") errEl.textContent = m.text;
+  };
+
+  try {
+    const r = await fetch("/api/ask", { method: "POST", body: fd, signal: abortCtl.signal });
+    if (!r.ok) throw new Error(await r.text());
+    const reader = r.body.getReader(), dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf("\n")) >= 0) {
+        const ln = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+        if (ln) handle(JSON.parse(ln));
+      }
+    }
+  } catch (e) {
+    if (e.name !== "AbortError") errEl.textContent = "Error: " + e.message;
+  } finally {
+    if (myGen === gen) { streaming = false; updatePill(); }
+  }
+}
+
+// ---------- Start / stop ----------
+async function start() {
+  errEl.textContent = "";
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: true,
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+  } catch (e) { errEl.textContent = "Camera/mic access denied: " + e.message; return; }
+  cam.srcObject = stream;
+
+  ctx = new AudioContext();
+  await ctx.resume();
+  sampleRate = ctx.sampleRate;
+  frameMs = FRAME_SAMPLES / sampleRate * 1000;
+
+  const code = `class Tap extends AudioWorkletProcessor {
+    constructor(){ super(); this.b = new Float32Array(${FRAME_SAMPLES}); this.n = 0; }
+    process(inputs){
+      const x = inputs[0][0]; if (!x) return true;
+      for (let i = 0; i < x.length; i++) {
+        this.b[this.n++] = x[i];
+        if (this.n === this.b.length) { this.port.postMessage(this.b.slice()); this.n = 0; }
+      }
+      return true;
+    }
+  }
+  registerProcessor("tap", Tap);`;
+  await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([code], { type: "application/javascript" })));
+
+  const src = ctx.createMediaStreamSource(new MediaStream(stream.getAudioTracks()));
+  const node = new AudioWorkletNode(ctx, "tap");
+  node.port.onmessage = e => onFrame(e.data);
+  const mute = ctx.createGain(); mute.gain.value = 0; // keeps the worklet running without playing the mic
+  src.connect(node); node.connect(mute); mute.connect(ctx.destination);
+
+  running = true;
+  startBtn.textContent = "Stop"; startBtn.classList.add("on");
+  updatePill();
+}
+
+function stop() {
+  interrupt();
+  running = false; recording = false; rec = []; pre = []; voiceFrames = 0;
+  stream.getTracks().forEach(t => t.stop());
+  ctx.close();
+  cam.srcObject = null;
+  level.style.width = "0";
+  startBtn.textContent = "Start conversation"; startBtn.classList.remove("on");
+  updatePill();
+}
+
+startBtn.addEventListener("click", () => (running ? stop() : start()));
+</script>
+</body>
+</html>
